@@ -426,3 +426,12 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+
+# whatsapp-alerts
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+dist/
