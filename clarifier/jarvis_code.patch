@@ -1,0 +1,1398 @@
+diff --git a/jarvis_code/README.txt b/jarvis_code/README.txt
+index 5f6f215..d850168 100644
+--- a/jarvis_code/README.txt
++++ b/jarvis_code/README.txt
+@@ -21,3 +21,26 @@ APP (React Native / Expo, folder app/)
+   Speech recognition needs a DEVELOPMENT BUILD (npx expo run:android / run:ios), not Expo Go.
+ 
+ Search the .py files for "REPEAT" (copy a block for a new agent) and "REPLACE LATER" (placeholders).
++
++CLARIFIER (Anjali) - clarifier.py is ONE standalone file: copy it into any project, it needs nothing else.
++  How to use it anywhere: see the top of clarifier.py (3 lines: Clarifier(), then step() per message).
++  It keeps asking until the request is complete (no fixed limit). Ways out: danger words -> SOS offer,
++  "never mind" -> cancel, a new question -> handled normally. Every 3rd question reminds "just say help".
++  Questions are written by the AI when one is available, checked for safety, with built-in backups.
++
++  In JARVIS it is wired in through small hooks marked "CLARIFIER":
++  agents.py          ClarifierAgent: a thin adapter that calls clarifier.plan()
++                     tools take asks={param: question}: the Clarifier asks it when that detail is missing
++                     action agents reply "NEED_DETAILS: tool.param" instead of guessing a missing detail
++                     new "sos" agent holds send_alert, so health searches no longer ask to confirm
++  orchestrator.py    Router.plan: keyword danger / missing details go to the clarifier first
++                     Router.ask_jev: one extra Jev question, is_danger (same call, no extra request)
++                     run_chain(): an agent missing a detail goes straight to the clarifier;
++                                  the clarifier is not safety-gated (it has no tools, only asks)
++                     handle(): merges the user's answer into the request, sets up the SOS yes/no
++                     Router.keyword(): zero word overlap now asks instead of picking the first agent
++  providers.py       Claude replies: keep only text blocks (thinking blocks crashed every call)
++  config.py          sos_agent, danger_floor (the Clarifier's own settings are at the top of clarifier.py)
++
++  python test_clarifier.py          23 tests of clarifier.py on its own (no other files, no keys)
++  python test_clarifier_jarvis.py   21 tests of the Clarifier inside JARVIS (mock mode, no keys)
+diff --git a/jarvis_code/agents.py b/jarvis_code/agents.py
+index bb97a08..be955ea 100644
+--- a/jarvis_code/agents.py
++++ b/jarvis_code/agents.py
+@@ -13,6 +13,7 @@ import re
+ from dataclasses import dataclass, field
+ from typing import get_type_hints
+ 
++import clarifier
+ from config import CONFIG
+ from orchestrator import AGENTS, TOOLS, AgentResult, BaseAgent, Orchestrator, log, tool
+ from providers import claude, text_llm
+@@ -28,6 +29,14 @@ GUARD = (
+     "Otherwise reply in 1-3 short sentences that sound natural when spoken aloud."
+ )
+ 
++# CLARIFIER: an action agent replies with this when a tool needs a detail the user did not give.
++NEED = "NEED_DETAILS:"
++NEED_RULE = (
++    f"Exception: if a tool needs a detail the user has not given (for example where they are), do not guess it "
++    f"and do not reply {DECLINE}. Reply with exactly {NEED} followed by the missing tool.parameter names, "
++    f"for example: {NEED} find_clinic.area"
++)
++
+ _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+ 
+ 
+@@ -125,7 +134,7 @@ class ActionAgent(SpecAgent):
+             return self.declined(f"model unavailable: {error}")
+ 
+     def loop(self, prompt):
+-        system = f"{self.spec.instructions}\n\n{GUARD}"
++        system = f"{self.spec.instructions}\n\n{GUARD}\n{NEED_RULE}"
+         tools = [tool_schema(t) for t in self.allowed_tools]
+         messages = [{"role": "user", "content": prompt}]
+         calls = []
+@@ -139,6 +148,8 @@ class ActionAgent(SpecAgent):
+ 
+             if response.stop_reason != "tool_use":
+                 text = "".join(b.text for b in response.content if b.type == "text").strip()
++                if NEED in text:
++                    return self.needs_details(text)
+                 if DECLINE in text:
+                     return self.declined("agent said it cannot help")
+                 if calls and all(call["error"] for call in calls):
+@@ -162,6 +173,17 @@ class ActionAgent(SpecAgent):
+ 
+         return self.declined("ran out of tool rounds")
+ 
++    def needs_details(self, text):
++        # CLARIFIER: turn "NEED_DETAILS: find_clinic.area" into what the Clarifier should ask for.
++        needs = []
++        for tool_name, param in re.findall(r"(\w+)\.(\w+)", text.split(NEED, 1)[1]):
++            if tool_name in self.allowed_tools and param in tool_schema(tool_name)["input_schema"]["properties"]:
++                needs.append({"tool": tool_name, "param": param,
++                              "question": TOOLS[tool_name]["asks"].get(param)})
++        if not needs:
++            return self.declined("said details were missing but named none we know")
++        return AgentResult(self.name, False, "needs details", meta={"declined": True, "needs": needs})
++
+ 
+ class RagAgent(SpecAgent):
+     # Retrieve, then answer ONLY from what was retrieved. Text only, so Claude -> Gemini works here.
+@@ -183,22 +205,19 @@ class RagAgent(SpecAgent):
+ 
+ 
+ class ClarifierAgent(SpecAgent):
+-    # The last resort. It must never fail, so it falls back to a fixed sentence if every model is down.
++    # CLARIFIER: thin adapter. All the logic is in clarifier.py, a standalone file.
++    # It keeps asking until the request is complete, skips questions when someone is in danger,
++    # and lets Claude word each question (checked, with a built-in question as backup).
+     def run(self, task, ctx):
+-        helpers = [a for a in AGENTS.values() if a.routable]
+-        names = ", ".join(a.name for a in helpers)
+-        fixed = f"I'm not sure I understood. I can help with: {names}. Which one do you need?"
+-        if not text_llm.live:
+-            return AgentResult(self.name, True, fixed, meta={"clarification": True})
+-        menu = "\n".join(f"- {a.name}: {a.description}" for a in helpers)
+-        prompt = (self.build_prompt(task, ctx) +
+-                  f"\n\nWhat you can help with:\n{menu}\n"
+-                  "Ask ONE short clarifying question, offering at most three concrete options.")
+-        try:
+-            text = text_llm.complete(f"{self.spec.instructions}\n\n{GUARD}", prompt, 150)
+-            return AgentResult(self.name, True, text.strip(), meta={"clarification": True})
+-        except Exception:
+-            return AgentResult(self.name, True, fixed, meta={"clarification": True})
++        ask_llm = (lambda system, user: text_llm.complete(system, user, 100)) if text_llm.live else None
++        plan = clarifier.plan(task, getattr(ctx, "clarification", None),
++                              sos_ready=CONFIG["sos_agent"] in AGENTS,
++                              needs=getattr(ctx, "needs", None),
++                              danger_hint=getattr(ctx, "danger", False),
++                              ask_llm=ask_llm,
++                              options=[a.name for a in AGENTS.values() if a.routable])
++        log.info("[%s] %s intent=%s missing=%s", self.name, plan.kind, plan.intent, plan.missing)
++        return AgentResult(self.name, True, plan.question, meta=plan.meta())
+ 
+ 
+ def build_agent(spec, agent_class):
+@@ -208,22 +227,28 @@ def build_agent(spec, agent_class):
+ # Tools. Type hints matter: they become the schema the LLM sees.
+ # REPLACE LATER: fake data. Call real APIs or datasets instead.
+ 
+-@tool("get_bus_times", "Next bus departures for a stop name (live source)")
++# asks: the question the Clarifier asks when that detail is missing. Optional: without it, it asks
++# "Could you tell me the <parameter>?". Give every new tool one per required parameter.
++@tool("get_bus_times", "Next bus departures for a stop name (live source)",
++      asks={"stop": "Which bus stop are you at?"})
+ def get_bus_times(stop: str) -> str:
+     return f"(fake data) next buses from {stop}: 08:15, 08:40, 09:05"
+ 
+ 
+-@tool("get_cached_timetable", "Scheduled bus timetable for a stop (offline backup source)")
++@tool("get_cached_timetable", "Scheduled bus timetable for a stop (offline backup source)",
++      asks={"stop": "Which bus stop are you at?"})
+ def get_cached_timetable(stop: str) -> str:
+     return f"(fake timetable) scheduled buses from {stop}: 08:20, 08:50, 09:20"
+ 
+ 
+-@tool("find_clinic", "Find the nearest clinic or hospital for an area")
++@tool("find_clinic", "Find the nearest clinic or hospital for an area",
++      asks={"area": "Which area are you in?"})
+ def find_clinic(area: str, open_now: bool = True) -> str:
+     return f"(fake data) nearest {'open ' if open_now else ''}clinic to {area}: Clinic Central"
+ 
+ 
+-@tool("send_alert", "Sends an emergency alert to a contact", risk="high")
++@tool("send_alert", "Sends an emergency alert to a contact", risk="high",
++      asks={"message": "What should the alert say?"})
+ def send_alert(message: str) -> str:
+     return f"(pretend) alert sent: {message}"
+ 
+@@ -259,11 +284,18 @@ ACTION_SPECS = [
+     ),
+     AgentSpec(
+         name="health",
+-        description="Health help: finding clinics or hospitals and raising emergency alerts.",
+-        instructions="You are the Health specialist. Be calm and brief. For emergencies use the alert tool.",
+-        tools=["find_clinic", "send_alert"],   # send_alert is high-risk, so this agent asks to confirm
++        description="Health help: finding clinics or hospitals.",
++        instructions="You are the Health specialist. Be calm and brief.",
++        tools=["find_clinic"],
+         fallbacks=["info"],
+     ),
++    AgentSpec(
++        name="sos",                       # CLARIFIER: alerts live in their own agent, so only alerts ask to confirm
++        description="Emergency alerts: sends an SOS to the user's emergency contacts when they are in danger.",
++        instructions="You are the SOS specialist. Send the alert with a short, clear message, then tell the user "
++                     "it was sent and to call 999 if they can.",
++        tools=["send_alert"],             # send_alert is high-risk, so this agent asks to confirm
++    ),
+ ]
+ 
+ # RAG agents.
+@@ -281,7 +313,8 @@ RAG_SPECS = [
+ CLARIFIER_SPEC = AgentSpec(
+     name="clarifier",
+     description="Asks the user a clarifying question.",
+-    instructions="You help the user say what they need. Be friendly and brief.",
++    instructions=("You help the user say what they need. Be friendly and brief. "
++                  "Never ask for card numbers, passwords, PINs or one-time codes."),
+     routable=False,
+ )
+ 
+diff --git a/jarvis_code/clarifier.py b/jarvis_code/clarifier.py
+new file mode 100644
+index 0000000..75617b0
+--- /dev/null
++++ b/jarvis_code/clarifier.py
+@@ -0,0 +1,539 @@
++"""
++clarifier.py - the Clarifier agent (owner: Anjali). ONE standalone file.
++
++Copy this file into any Python 3.9+ project. It needs nothing else: no other project files,
++no packages, no API keys. An AI model is optional (it words the questions more naturally).
++
++WHAT IT DOES
++  The Clarifier steps in when a request cannot be acted on yet, and keeps asking until it can:
++    1. Danger ("someone is following me")      -> no questions: offer SOS straight away.
++    2. A detail is missing ("I'm going out")   -> ask for exactly what is missing.
++    3. The request is unclear                  -> ask the user to say more.
++  Each answer is added to the original request, and it checks again. It keeps looping until
++  nothing is missing. There is no fixed number of questions. Ways out of the loop at any time:
++    - danger words (even mid-question)  -> SOS offer
++    - "never mind" / "cancel"           -> cancelled
++    - a brand-new question              -> the old one is dropped
++  Every few questions it also reminds the user they can just say "help".
++
++USE IT IN ANY PROJECT (3 lines)
++    from clarifier import Clarifier
++    clarifier = Clarifier()                  # optional: Clarifier(ask_llm=my_function)
++    turn = clarifier.step("I'm going out")   # call once per user message
++  turn.action is one of:
++    "ask"       -> speak turn.say, then pass the user's reply to step() again
++    "proceed"   -> the request is complete: handle turn.request (it includes every answer)
++    "sos"       -> speak turn.say (the SOS offer) and start your emergency flow
++    "cancelled" -> speak turn.say
++  Optional arguments to step(): session= (one per user), unclear=True (your own classifier says
++  the request is unclear), needs=[...] (a tool is missing details), danger_hint=True (your own
++  danger detector fired).
++
++AI WORDING (optional)
++  ask_llm is any function (system_prompt, user_prompt) -> text. If given, the AI writes each
++  question to fit the conversation. Its question is checked (one short question, nothing about
++  card numbers, PINs or codes); if it fails the check or the AI is down, a built-in question is
++  used instead. The danger message is never AI-written: it must be instant and exact.
++
++SETTINGS
++  Change with Clarifier(languages=["en", "fr"], help_every=3, max_questions=None) or configure().
++
++IN JARVIS (the team project) the same logic is used through four hooks in orchestrator.py and
++agents.py, all marked "CLARIFIER": needs_clarifier, resume, plan, after_turn.
++"""
++import re
++from dataclasses import dataclass, field
++
++SETTINGS = {
++    "languages": ["en"],       # add "fr" to answer French requests in French
++    "max_questions": None,     # None = keep asking until complete; a number = stop after that many
++    "help_every": 3,           # every Nth question also says "you can just say 'help'"; 0 = never
++    "max_question_words": 25,  # longest AI-written question we accept
++}
++
++
++def configure(**changes):
++    unknown = set(changes) - set(SETTINGS)
++    if unknown:
++        raise ValueError(f"Unknown Clarifier settings: {sorted(unknown)}")
++    SETTINGS.update(changes)
++
++
++AP = "['’]"   # straight or curly apostrophe, as speech-to-text may produce either
++
++
++@dataclass
++class ClarifyState:
++    # What we are in the middle of clarifying, kept per session.
++    original: str                                  # the request that needed clarifying
++    question: str                                  # the last question we asked
++    asked: list = field(default_factory=list)      # the details that question asked for
++    answers: list = field(default_factory=list)    # everything the user said since
++    attempts: int = 0                              # how many questions we have asked
++
++
++@dataclass
++class Plan:
++    kind: str                       # "ask" | "sos" | "give_up"
++    original: str
++    question: str = None
++    intent: str = None
++    missing: list = field(default_factory=list)
++    escalate: bool = False          # True = offer the SOS agent as a yes/no
++    lang: str = "en"
++
++    def meta(self):
++        return {"clarification": True, "kind": self.kind, "intent": self.intent, "lang": self.lang,
++                "missing": self.missing, "original": self.original, "escalate": self.escalate}
++
++
++def _rx(*patterns):
++    return [re.compile(p, re.I) for p in patterns]
++
++
++# ---------------------------------------------------------------- language
++
++FRENCH_MARKERS = re.compile(
++    rf"\b(je|j{AP}|tu|vous|il|elle|on|est-ce|c{AP}est|suis|vais|sors|pars|mon|ma|mes|famille|que|qui|pas|"
++    r"une|des|du|au|aux|chez|où|quand|merci|oui|aidez|aide|secours|arnaque|retour|heures?|maison|"
++    rf"quelqu{AP}un|suit|frappe|peur|dis|dites|ma|mon)\b", re.I)
++ENGLISH_MARKERS = re.compile(
++    r"\b(i|i'm|im|my|the|is|are|you|going|will|to|what|when|where|out|home|back|help|please|yes)\b", re.I)
++
++
++def detect_lang(text):
++    # English only unless "fr" is in SETTINGS["languages"].
++    if "fr" not in SETTINGS["languages"]:
++        return "en"
++    fr, en = len(FRENCH_MARKERS.findall(text or "")), len(ENGLISH_MARKERS.findall(text or ""))
++    return "fr" if fr > en else "en"
++
++
++SAY = {
++    "sos":        {"en": "It sounds like you may be in danger. Should I alert your emergency contacts now? "
++                         "If you can, call 999.",
++                   "fr": "On dirait que vous êtes en danger. Voulez-vous que j'alerte vos contacts d'urgence "
++                         "maintenant ? Si vous le pouvez, appelez le 999."},
++    "sos_no_agent": {"en": "It sounds like you may be in danger. Please call 999 or 112 now.",
++                     "fr": "On dirait que vous êtes en danger. Appelez le 999 ou le 112 maintenant."},
++    "give_up":    {"en": "I'm still not sure what you need. If you need help, I can alert your emergency "
++                         "contacts. Should I do that?",
++                   "fr": "Je ne suis toujours pas sûr de ce dont vous avez besoin. Si vous avez besoin d'aide, "
++                         "je peux alerter vos contacts d'urgence. Voulez-vous que je le fasse ?"},
++    "give_up_no_agent": {"en": "I'm still not sure what you need. If it's an emergency, please call 999 or 112.",
++                         "fr": "Je ne suis toujours pas sûr de ce dont vous avez besoin. Si c'est une urgence, "
++                               "appelez le 999 ou le 112."},
++    "cancelled":  {"en": "Okay, cancelled.", "fr": "D'accord, c'est annulé."},
++    "again":      {"en": "Sorry, I didn't catch that. ", "fr": "Désolé, je n'ai pas compris. "},
++    "help_hint":  {"en": " If you need urgent help, just say help.",
++                   "fr": " Si vous avez besoin d'aide urgente, dites simplement au secours."},
++    "unclear":    {"en": "Sorry, I didn't quite understand. Could you say that another way?",
++                   "fr": "Désolé, je n'ai pas bien compris. Pouvez-vous le dire autrement ?"},
++    "unclear_options": {"en": "I'm not sure I understood. I can help with: {options}. Which one do you need?",
++                        "fr": "Je ne suis pas sûr d'avoir compris. Je peux aider avec : {options}. "
++                              "Lequel vous faut-il ?"},
++}
++
++
++# ---------------------------------------------------------------- danger and cancel
++
++DANGER = _rx(
++    # English
++    r"^\W*(please\W+)?help(\W+me)?(\W+please)?\W*$",
++    r"\bsos\b",
++    rf"\b(it{AP}?s an?|this is an?|medical) emergency\b",
++    r"\bcall (the )?(police|ambulance|samu|999|112|114)\b",
++    rf"\b(i{AP}?m|i am) (so )?(scared|afraid|terrified|in danger|being followed|hurt|bleeding|trapped)\b",
++    rf"\bsomeone({AP}?s| is)? (following|attacking|hitting|hurting|chasing|threatening) me\b",
++    rf"\b(he|she|they)({AP}?s| is| are) (hitting|hurting|beating|attacking|threatening|following) me\b",
++    rf"\b(can{AP}?t|cannot) breathe\b",
++    rf"\b(fell|fallen)( down)? and (i )?can{AP}?t get up\b",
++    r"\bheart attack\b",
++    # French
++    r"^\W*(à|a) l['’ ]?aide\W*$",
++    r"\bau secours\b|\baidez[- ]moi\b|\baide[- ]moi\b",
++    rf"\bc{AP}est une urgence\b|\burgence médicale\b",
++    r"\bappel(le|ez|er) (la police|le samu|les secours|une ambulance|le 999|le 112|le 114)\b",
++    rf"\bj{AP}\s?ai (très )?peur\b|\bje suis (en danger|blessée?|suivie?|coincée?)\b",
++    r"\b(quelqu['’]un|on|il|elle|ils) me (suit|suivent|frappe|frappent|bat|battent|menace|menacent|attaque|"
++    r"attaquent|poursuit|poursuivent)\b",
++    r"\bje (ne )?(peux|arrive) (pas|plus) (à )?respirer\b",
++    r"\bje suis tombée? et je (ne )?(peux|arrive) pas (à )?me relever\b",
++    r"\bcrise cardiaque\b",
++)
++
++CANCEL = re.compile(
++    r"^\W*(cancel|never ?mind|forget it|stop|nothing|no thanks?"
++    r"|annule[rz]?|laisse(z)? tomber|oublie[z]?|rien|non merci|c['’]est bon|arrête[z]?)\W*$", re.I)
++
++
++def is_danger(text):
++    # Check each sentence on its own too, so "I'm going out. Help!" (an answer merged in) still counts.
++    parts = [text or "", *re.split(r"[.!?]+", text or "")]
++    return any(p.search(part) for part in parts for p in DANGER)
++
++
++def is_cancel(text):
++    return bool(CANCEL.match(text or ""))
++
++
++# ---------------------------------------------------------------- detail detectors
++
++EN_NUMBERS = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|forty-five"
++FR_NUMBERS = ("une?|deux|trois|quatre|cinq|six|sept|huit|neuf|dix|onze|douze|quinze|vingt|trente|quarante|"
++              "quarante-cinq")
++TIME = re.compile(
++    r"\b(\d{1,2}[:h.]\d{2}"                                                    # 14:30, 2h30
++    r"|\d{1,2}\s*(am|pm|h)\b"                                                   # 2pm, 14h
++    r"|\d{1,2}\s+heures?"                                                       # 5 heures
++    r"|noon|midday|midnight|tonight|this (morning|afternoon|evening)|tomorrow( morning)?"
++    rf"|(by|at|until|till|around|before)\s+(\d{{1,2}}|{EN_NUMBERS})"            # by two, at 5
++    rf"|(\d{{1,3}}|{EN_NUMBERS}|an?|half an?)\s+(minutes?|mins?|hours?|hrs?)"    # ten minutes
++    r"|half an hour|an hour"
++    r"|midi|minuit|ce soir|cet après-midi|ce matin|demain( matin| soir)?|une demi-heure"
++    rf"|(vers|avant|à|a|jusqu{AP}à)\s+({FR_NUMBERS})\s+heures?"                 # vers deux heures
++    rf"|(\d{{1,3}}|{FR_NUMBERS}|une demi)\s+(minutes?|heures?))\b", re.I)        # dix minutes
++
++PLACE_WORDS = re.compile(
++    r"\b(home|work|school|uni|university|campus|the (beach|sea|market|shop|shops|gym|hospital|clinic|"
++    r"office|station|airport|mall|bus stop|mountain|trail)|church|temple|mosque|town"
++    r"|maison|travail|boulot|école|université|fac|plage|mer|marché|magasin|gym|hôpital|clinique|bureau|"
++    r"gare|aéroport|église|mosquée|ville|montagne)\b", re.I)
++NOT_A_PLACE = set(f"""a an the my your his her our their be bed get go come see do make about around now later soon
++    today tonight tomorrow noon midnight morning afternoon evening night while bit case back minutes minute hours hour
++    half time {EN_NUMBERS.replace('|', ' ')}
++    la le les l un une mon ma mes ton ta son sa nos vos leur peu moment rien quelques minutes heure heures
++    midi minuit demain soir matin retour quel quelle {FR_NUMBERS.replace('|', ' ').replace('?', '')} un une""".split())
++PLACE_AFTER = re.compile(
++    rf"\b(?:to|at|towards?|up|near|in|from|for|leaving|via|vers|pour|chez|au|aux|à|de|près de)\s+"
++    rf"(?:the\s+|la\s+|le\s+|les\s+|l{AP}\s*)?([a-zà-ÿ][\w'’-]*)", re.I)
++
++FILLER = set("""yes yeah no ok okay um uh er erm and back by at i i'm im will be going to it is it's in on about around
++    for until till maybe like just so well then the a
++    dunno idk know don't dont not sure whatever somewhere anywhere out there here
++    oui non euh bah ben je j j'sais sais pas ne vais être suis à au aux vers dans pour de la le les l en et
++    c'est bon peut-être reviens rentre serai là quelque part n'importe où sais-pas""".split())
++
++
++def has_time(text):
++    return bool(TIME.search(text))
++
++
++def has_place(text):
++    if PLACE_WORDS.search(text):
++        return True
++    return any(m.group(1).lower() not in NOT_A_PLACE for m in PLACE_AFTER.finditer(text))
++
++
++def content_words(text):
++    # What is left of an answer once times and filler words are taken out.
++    words = re.findall(r"[a-zà-ÿ0-9][\w'’-]*", TIME.sub(" ", text).lower())
++    return [w for w in words if w not in FILLER]
++
++
++# ---------------------------------------------------------------- rules: actions that need details
++
++@dataclass
++class Rule:
++    name: str
++    trigger: re.Pattern
++    slots: list                # detail names, in the order we ask for them
++    questions: dict            # language -> {tuple of missing slots -> the question to ask}
++    detect: dict               # slot -> function(full_text, match) -> True if present
++
++
++def _message_after(match):
++    # For "tell my family ..." style rules: the message is whatever follows the trigger.
++    rest = match.group("rest") or match.group("reste") or ""
++    return len(content_words(rest)) >= 1
++
++
++# Built-in rules: fast, model-free checks for the most common actions. Tools passed in as `needs`
++# work without any rule. REPEAT PER ACTION: copy one Rule(...) block; first match wins.
++RULES = [
++    Rule(
++        name="running_late",
++        trigger=re.compile(
++            rf"\b(i{AP}?ll|i will|i{AP}?m going to|gonna) be late\b|\bextend (my )?(trip|time|check-?in)\b"
++            r"|\bje (serai|vais être|vais etre|suis) en retard\b|\bprolonge[rz]? (mon|le) (trajet|temps)\b", re.I),
++        slots=["time"],
++        questions={"en": {("time",): "By how long?"},
++                   "fr": {("time",): "De combien de temps ?"}},
++        detect={"time": lambda text, m: has_time(text)},
++    ),
++    Rule(
++        name="scam_check",
++        trigger=re.compile(
++            r"\b(scam|fraud|phishing)\b|\bis (this|it|that) (real|legit|genuine|true)\b"
++            r"|\b(strange|weird|suspicious|fake) (message|sms|text|call|email|whatsapp)\b"
++            rf"|\b(arnaque|escroquerie|fraude|hameçonnage)\b|\bc{AP}est (vrai|réel|vraiment ma banque)\b"
++            r"|\b(message|sms|appel) (bizarre|suspect|étrange|frauduleux)\b", re.I),
++        slots=["message"],
++        questions={"en": {("message",): "Please read me the message you received. "
++                                        "Don't read out any card numbers or codes."},
++                   "fr": {("message",): "Lisez-moi le message que vous avez reçu. "
++                                        "Ne lisez pas de numéro de carte ni de code."}},
++        detect={"message": lambda text, m: len(content_words(m.re.sub(" ", text))) >= 5},
++    ),
++    Rule(
++        name="tell_family",
++        trigger=re.compile(
++            r"\b(tell|message|text|warn|remind|let)\s+(my\s+)?(family|mum|mom|mother|dad|father|son|"
++            r"daughter|sister|brother|wife|husband|parents?|contacts?|neighbou?r|circle)"
++            r"(\s+know)?(\s+that)?\s*[:,]?(?P<rest>.*)$"
++            r"|\b(dis|dites|préviens|prévenez|rappelle|rappelez|écris|écrivez)\s+(à\s+)?(ma |mon |mes )?"
++            r"(famille|mère|maman|père|papa|fils|fille|sœur|soeur|frère|femme|mari|parents|contacts?|voisine?)"
++            r"(\s+que)?\s*[:,]?(?P<reste>.*)$", re.I),
++        slots=["message"],
++        questions={"en": {("message",): "What would you like me to tell them?"},
++                   "fr": {("message",): "Que voulez-vous que je leur dise ?"}},
++        detect={"message": lambda text, m: _message_after(m)},
++    ),
++    Rule(
++        name="check_in",
++        trigger=re.compile(
++            rf"(^\W*|\b(i{AP}?m|i am|we{AP}?re|we are)\s+)(going out|heading( out| to| home| off)?|leaving|"
++            r"walking home|going home|going fishing|going hiking|going (out )?to sea|off to|on my way)\b"
++            r"|\b(start|begin) (a |my )?(trip|check-?in)\b|\bcheck on me\b"
++            rf"|(^\W*|\b(je|on)\s+)(sors|pars|vais sortir|rentre|m{AP}en vais|vais à la pêche|vais pêcher|"
++            r"vais à la mer|vais en mer|vais randonner|vais faire une randonnée)\b"
++            r"|\bje suis en route\b|\bsurveille[rz]?[- ]moi\b", re.I),
++        slots=["place", "time"],
++        questions={"en": {("place", "time"): "Where are you going, and when will you be back?",
++                          ("place",): "Where are you going?",
++                          ("time",): "When should I expect you back?"},
++                   "fr": {("place", "time"): "Où allez-vous, et quand serez-vous de retour ?",
++                          ("place",): "Où allez-vous ?",
++                          ("time",): "À quelle heure dois-je vous attendre ?"}},
++        detect={"place": lambda text, m: has_place(text), "time": lambda text, m: has_time(text)},
++    ),
++]
++
++
++def match_rule(text):
++    for rule in RULES:
++        match = rule.trigger.search(text or "")
++        if match:
++            return rule, match
++    return None, None
++
++
++def missing_details(text, state=None):
++    # Which required details are still missing. Returns (rule, [slots]) or (None, []).
++    rule, match = match_rule(state.original if state else text)
++    if rule is None:
++        return None, []
++    missing = [s for s in rule.slots if not rule.detect[s](text, match)]
++    if state:
++        # An answer to our question fills the detail it was asked for, even without keywords:
++        # "Where are you going?" -> "Le Pouce" has no "to"/"at", but it is clearly the place.
++        for slot in list(missing):
++            if slot in state.asked and any(_answer_fills(slot, a) for a in state.answers):
++                missing.remove(slot)
++    return rule, missing
++
++
++def _answer_fills(slot, answer):
++    if slot == "time":
++        return has_time(answer)
++    if slot == "message":
++        return len(content_words(answer)) >= 2
++    return len(content_words(answer)) >= 1
++
++
++def needs_clarifier(text, state=None):
++    # Router hook: True = skip normal routing and send this to the clarifier.
++    return is_danger(text) or bool(missing_details(text, state)[1])
++
++
++# ---------------------------------------------------------------- the decision
++
++SENSITIVE = re.compile(r"\b(card|cvv|pin|password|passcode|otp|one[- ]time|account number|bank details"
++                       r"|carte|mot de passe|code)\b", re.I)
++KEEP_EXACT_WORDING = {"scam_check"}   # its built-in question carries a safety warning: never reworded
++
++
++def ask_for_tool_details(needs):
++    # Any tool, any theme: build the question from the tool's own `asks`, or from the parameter name.
++    if len(needs) == 1:
++        need = needs[0]
++        return need.get("question") or f"Could you tell me the {need['param'].replace('_', ' ')}?"
++    labels = [n["param"].replace("_", " ") for n in needs]
++    return f"Could you tell me the {', '.join(labels[:-1])} and {labels[-1]}?"
++
++
++def check_ai_question(text):
++    # Accept the AI's question only if it is one short, safe question. None = use the built-in one.
++    lines = [line.strip().strip('"“”') for line in (text or "").splitlines() if line.strip()]
++    if not lines:
++        return None
++    question = lines[0]
++    if not question.endswith("?") or question.count("?") > 2:
++        return None
++    if len(question.split()) > SETTINGS["max_question_words"]:
++        return None
++    if SENSITIVE.search(question) or "NEED_DETAILS" in question or "CANNOT_HELP" in question:
++        return None
++    return question
++
++
++def ai_question(ask_llm, original, answers, missing, fallback, options, lang):
++    # Let a model word the question to fit the conversation. Any failure -> the built-in question.
++    language = "French" if lang == "fr" else "English"
++    system = ("You are the Clarifier of a voice safety assistant. Write ONE short question the "
++              "assistant will say out loud. Ask only for what is missing. Plain, friendly words, "
++              f"at most {SETTINGS['max_question_words']} words. Never ask for card numbers, PINs, "
++              f"passwords or codes. Reply with the question only, in {language}.")
++    lines = [f"What the user asked: {original}"]
++    if answers:
++        lines.append("Their answers so far (they did not give what was needed): " + " | ".join(answers))
++        lines.append("Rephrase rather than repeating the same question.")
++    lines.append("Missing: " + (", ".join(m.replace("_", " ") for m in missing) if missing
++                                else "it is not clear what they need"))
++    if options:
++        lines.append("What the assistant can help with: " + ", ".join(options))
++    lines.append(f"A plain version of the question: {fallback}")
++    try:
++        return check_ai_question(ask_llm(system, "\n".join(lines))) or fallback
++    except Exception:
++        return fallback
++
++
++def plan(text, state=None, sos_ready=False, needs=None, danger_hint=False, ask_llm=None, options=None):
++    # Decide what the Clarifier says this turn. `text` is the request (already merged with answers).
++    # needs: details a tool is missing. danger_hint: another detector (e.g. Jev) thinks it is an emergency.
++    # ask_llm: optional AI to word the question. options: names of what the assistant can help with.
++    original = state.original if state else text
++    attempts = state.attempts if state else 0
++    answers = state.answers if state else []
++    lang = detect_lang(original)
++
++    # 1. Danger always wins, even in the middle of the loop. Fixed wording, no AI.
++    if danger_hint or is_danger(text):
++        say = SAY["sos" if sos_ready else "sos_no_agent"][lang]
++        return Plan("sos", original, say, escalate=sos_ready, lang=lang)
++
++    # 2. Optional limit. By default there is none: it keeps asking until the request is complete.
++    limit = SETTINGS["max_questions"]
++    if limit is not None and attempts >= limit:
++        say = SAY["give_up" if sos_ready else "give_up_no_agent"][lang]
++        return Plan("give_up", original, say, escalate=sos_ready, lang=lang)
++
++    # 3. What is missing, and the built-in question for it.
++    if needs:
++        intent, missing, fallback = needs[0]["tool"], [n["param"] for n in needs], ask_for_tool_details(needs)
++    else:
++        rule, missing = missing_details(text, state)
++        if rule and missing:
++            intent, fallback = rule.name, rule.questions[lang][tuple(missing)]
++        else:
++            intent, missing = (rule.name if rule else None), []
++            fallback = (SAY["unclear_options"][lang].format(options=", ".join(options)) if options
++                        else SAY["unclear"][lang])
++    if state and missing and set(missing) == set(state.asked):
++        fallback = SAY["again"][lang] + fallback          # asking for the same thing again
++
++    # 4. The AI words it (optional), except where the exact wording matters.
++    question = fallback
++    if ask_llm is not None and intent not in KEEP_EXACT_WORDING:
++        question = ai_question(ask_llm, original, answers, missing, fallback, options, lang)
++
++    # 5. Every few questions, remind them there is always a way out.
++    every = SETTINGS["help_every"]
++    if every and (attempts + 1) % every == 0:
++        question += SAY["help_hint"][lang]
++    return Plan("ask", original, question, intent, missing, lang=lang)
++
++
++# ---------------------------------------------------------------- the loop (turn by turn)
++
++QUESTION_START = re.compile(
++    r"^\W*(what|when|where|who|why|how|which|is|are|can|could|should|do|does|will|would"
++    r"|qu['’]est-ce|est-ce|que|quoi|quand|où|qui|pourquoi|comment|quel|quelle|quels|quelles|puis-je|pouvez-vous)\b",
++    re.I)
++
++
++def looks_like_new_request(user_text, state):
++    # An answer is short and is not itself a question. A new question, or a long reply to a
++    # general "what do you need?" question, is a fresh request rather than an answer.
++    if is_danger(user_text):
++        return False
++    if "?" in user_text or QUESTION_START.match(user_text):
++        return True
++    return not state.asked and len(user_text.split()) > 6
++
++
++def resume(state, user_text):
++    # Start of a turn. Returns (state, text_to_handle, reply_now).
++    if state is None:
++        return None, user_text, None
++    if is_cancel(user_text):
++        return None, None, SAY["cancelled"][detect_lang(state.original)]
++    if looks_like_new_request(user_text, state):
++        return None, user_text, None   # they moved on: drop the old question, route this on its own
++    state.answers.append(user_text)
++    merged = ". ".join([state.original.rstrip(" .?!"), *(a.strip(" .") for a in state.answers)])
++    return state, merged, None
++
++
++def after_turn(state, results):
++    # End of a turn. `results`: objects with .output and .meta (the Clarifier's reply among them).
++    # Returns (new_state, sos_task). new_state set = we asked a question and wait for the answer.
++    # sos_task set = offer the SOS agent as a yes/no.
++    for result in results:
++        meta = getattr(result, "meta", {}) or {}
++        if not meta.get("clarification"):
++            continue
++        if meta["kind"] != "ask":
++            task = ("Send an emergency alert to the user's emergency contacts now. "
++                    f"What the user said: '{meta['original']}'")
++            return None, task if meta["escalate"] else None
++        attempts = (state.attempts if state else 0) + 1
++        answers = state.answers if state else []
++        return ClarifyState(meta["original"], result.output, list(meta["missing"]), list(answers), attempts), None
++    return None, None
++
++
++# ---------------------------------------------------------------- simple interface for any project
++
++@dataclass
++class Turn:
++    action: str          # "ask" | "proceed" | "sos" | "cancelled"
++    say: str = None      # what to say to the user (None on "proceed")
++    request: str = None  # the full request so far, every answer included
++
++
++@dataclass
++class _Reply:
++    output: str
++    meta: dict
++
++
++class Clarifier:
++    """Drop-in Clarifier. Keeps each user's half-finished request until it is complete."""
++
++    def __init__(self, ask_llm=None, sos_available=True, options=None, **settings):
++        # ask_llm: optional function (system, user) -> text. sos_available: you have an emergency flow.
++        # options: names of what your assistant can do, offered when a request is unclear.
++        if settings:
++            configure(**settings)
++        self.ask_llm, self.sos_available, self.options = ask_llm, sos_available, options or []
++        self.sessions = {}
++
++    def step(self, user_text, session="default", unclear=False, needs=None, danger_hint=False):
++        state = self.sessions.pop(session, None)
++        state, text, cancelled = resume(state, user_text)
++        if cancelled:
++            return Turn("cancelled", cancelled)
++        if not (unclear or needs or danger_hint or needs_clarifier(text, state)):
++            return Turn("proceed", request=text)
++        decision = plan(text, state, self.sos_available, needs, danger_hint, self.ask_llm, self.options)
++        new_state, _ = after_turn(state, [_Reply(decision.question, decision.meta())])
++        if new_state is not None:
++            self.sessions[session] = new_state
++            return Turn("ask", decision.question, text)
++        return Turn("sos", decision.question, text)
++
++    def waiting(self, session="default"):
++        # True while this user owes us an answer.
++        return session in self.sessions
+diff --git a/jarvis_code/config.py b/jarvis_code/config.py
+index c762625..ac03a31 100644
+--- a/jarvis_code/config.py
++++ b/jarvis_code/config.py
+@@ -23,5 +23,10 @@ CONFIG = {
+ 
+     "max_steps": 4,             # cap on how many routed steps one request may chain
+     "terminal_agent": "clarifier",   # last resort when every agent in a chain gave up
++
++    # Clarifier
++    "sos_agent": "sos",            # the agent that sends alerts (give it Rushil's WhatsApp tool later)
++    "danger_floor": 0.70,          # Jev's danger probability at or above this goes to the SOS offer
++    # The Clarifier's own settings (languages, question limit, help reminder) are at the top of clarifier.py.
+     "audit_log": "audit.jsonl",
+ }
+diff --git a/jarvis_code/orchestrator.py b/jarvis_code/orchestrator.py
+index 20964c4..96b23f5 100644
+--- a/jarvis_code/orchestrator.py
++++ b/jarvis_code/orchestrator.py
+@@ -17,6 +17,7 @@ import time
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass, field
+ 
++from clarifier import after_turn, needs_clarifier, resume
+ from config import CONFIG
+ from jev import JevClient, choice_question, noul_question, read_choice, read_noul
+ from providers import text_llm
+@@ -50,15 +51,19 @@ class Context:
+     user_text: str
+     history: list = field(default_factory=list)
+     results: list = field(default_factory=list)
++    clarification: object = None   # CLARIFIER: the question we asked last turn, if any (clarifier.ClarifyState)
++    needs: list = field(default_factory=list)   # CLARIFIER: tool details an agent found missing this turn
++    danger: bool = False                         # CLARIFIER: Jev thinks the user may be in danger
+ 
+ 
+ # Tools: plain functions agents may call. Agents never import them, they ask via use_tool().
+ TOOLS = {}
+ 
+ 
+-def tool(name, description, risk="low"):
++def tool(name, description, risk="low", asks=None):
++    # asks: optional {parameter: question} the Clarifier uses when that detail is missing.
+     def wrap(fn):
+-        TOOLS[name] = {"fn": fn, "description": description, "risk": risk}
++        TOOLS[name] = {"fn": fn, "description": description, "risk": risk, "asks": asks or {}}
+         return fn
+     return wrap
+ 
+@@ -115,6 +120,7 @@ class RouteDecision:
+     agent: str
+     confidence: float
+     clear: float
++    danger: float = 0.0   # CLARIFIER: Jev's probability that the user is in danger
+ 
+ 
+ class Router:
+@@ -123,9 +129,18 @@ class Router:
+ 
+     def plan(self, ctx):
+         terminal = CONFIG["terminal_agent"]
++        # CLARIFIER: danger words, or a known action missing a detail ("I'm going out"), skip routing.
++        if needs_clarifier(ctx.user_text, ctx.clarification):
++            log.info("route: danger or missing details -> %s", terminal)
++            return [Step(terminal, ctx.user_text)]
+         decision = self.ask_jev(ctx)
+ 
+         if decision is not None:
++            # CLARIFIER: Jev catches danger worded in ways the keyword list does not know.
++            if decision.danger >= CONFIG["danger_floor"]:
++                log.info("route: Jev says the user may be in danger (%.2f) -> %s", decision.danger, terminal)
++                ctx.danger = True
++                return [Step(terminal, ctx.user_text)]
+             if decision.clear < CONFIG["clear_floor"]:
+                 log.info("route: Jev says the request is unclear (%.2f) -> %s", decision.clear, terminal)
+                 return [Step(terminal, ctx.user_text)]
+@@ -156,6 +171,9 @@ class Router:
+                 "Is the request clear enough to act on without asking the user a follow-up question? "
+                 "Use recent_turns for context."),
+             "route": choice_question("Which specialist should handle this request?", options),
++            # CLARIFIER: one more yes/no in the same Jev call, so it costs no extra request.
++            "is_danger": noul_question(
++                "Does the user sound like they are in danger or facing an emergency right now?"),
+         }
+         state = {"request": ctx.user_text, "recent_turns": ctx.history[-4:]}
+         try:
+@@ -165,7 +183,8 @@ class Router:
+             label, confidence, _ = read_choice(answers["route"])
+             if label != "none" and label not in agents:
+                 confidence = 0.0   # Jev named something we do not have: do not trust it
+-            return RouteDecision(label, confidence, read_noul(answers["is_clear"]))
++            danger = read_noul(answers["is_danger"]) if "is_danger" in answers else 0.0
++            return RouteDecision(label, confidence, read_noul(answers["is_clear"]), danger)
+         except Exception as error:
+             log.warning("could not read Jev's routing answer (%s)", error)
+             return None
+@@ -200,6 +219,8 @@ class Router:
+             return len(words & set(re.findall(r"\w+", agent.description.lower())))
+ 
+         best = max(agents.values(), key=overlap)
++        if overlap(best) == 0:
++            return [Step(CONFIG["terminal_agent"], ctx.user_text)]   # no word in common: ask, don't guess
+         return [Step(best.name, ctx.user_text)]
+ 
+ 
+@@ -289,6 +310,7 @@ class Orchestrator:
+         self.synth = Synthesizer()
+         self.history = []
+         self.pending = None   # a Step waiting for the user's yes/no
++        self.clarifying = None   # CLARIFIER: the question we are waiting on an answer for
+ 
+     def handle(self, user_text):
+         if self.pending:
+@@ -306,11 +328,22 @@ class Orchestrator:
+             self.gov.audit("blocked_input", text=user_text)
+             return text
+ 
+-        ctx = Context(text, self.history)
++        # CLARIFIER: if we asked a question last turn, fold this answer into the original request.
++        state, self.clarifying = self.clarifying, None
++        state, text, cancelled = resume(state, text)
++        if cancelled:
++            return cancelled
++
++        ctx = Context(text, self.history, clarification=state)
+         for step in self.router.plan(ctx)[: CONFIG["max_steps"]]:
+             prompt = self.run_chain(self.with_chain(step), ctx)
+             if prompt is not None:
+                 return prompt   # a confirmation question or a refusal ends the turn
++
++        # CLARIFIER: remember the question we just asked, or set up the SOS yes/no offer.
++        self.clarifying, sos_task = after_turn(state, ctx.results)
++        if sos_task and CONFIG["sos_agent"] in AGENTS:
++            self.pending = Step(CONFIG["sos_agent"], sos_task)
+         return self.reply(ctx)
+ 
+     def with_chain(self, step):
+@@ -335,7 +368,9 @@ class Orchestrator:
+             attempt = Step(name, step.task, names[index + 1:])
+ 
+             already_approved = confirmed and index == 0
+-            if not already_approved:
++            # CLARIFIER: the terminal agent has no tools and only asks a question, so it is never gated.
++            # Otherwise Jev could refuse "someone is hitting me" and block the SOS offer.
++            if not already_approved and name != CONFIG["terminal_agent"]:
+                 decision = self.gate.decide(attempt)
+                 self.gov.audit("attempt", agent=name, task=step.task, gate=decision)
+                 if decision == "refuse":
+@@ -349,6 +384,15 @@ class Orchestrator:
+             if result.ok and (not agent.verify or self.verifier.accepts(step.task, result)):
+                 ctx.results.append(result)
+                 return None
++            if result.meta.get("needs") and name != CONFIG["terminal_agent"]:
++                # CLARIFIER: the right agent was found but the user left out a detail its tool needs.
++                # Other agents cannot fix that, so go straight to the clarifier to ask for it.
++                log.info("chain: %s needs %s -> %s", name, result.meta["needs"], CONFIG["terminal_agent"])
++                ctx.needs = result.meta["needs"]
++                terminal = AGENTS.get(CONFIG["terminal_agent"])
++                if terminal is not None:
++                    ctx.results.append(self.run_agent(terminal, Step(terminal.name, step.task), ctx))
++                    return None
+             log.info("chain: %s could not do it -> next agent", name)
+             self.gov.audit("fallthrough", agent=name, output=result.output)
+ 
+diff --git a/jarvis_code/providers.py b/jarvis_code/providers.py
+index 02f57c7..c02cd1b 100644
+--- a/jarvis_code/providers.py
++++ b/jarvis_code/providers.py
+@@ -39,7 +39,8 @@ class ClaudeProvider(LLMProvider):
+             system=system,
+             messages=[{"role": "user", "content": user}],
+         )
+-        return response.content[0].text
++        # Newer models may send a "thinking" block first: keep only the text blocks.
++        return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+ 
+ 
+ class GeminiProvider(LLMProvider):
+diff --git a/jarvis_code/test_clarifier.py b/jarvis_code/test_clarifier.py
+new file mode 100644
+index 0000000..fde4ed2
+--- /dev/null
++++ b/jarvis_code/test_clarifier.py
+@@ -0,0 +1,203 @@
++"""
++Tests for clarifier.py ON ITS OWN: no other project files, no API keys, no packages.
++Copy clarifier.py + this file into any folder and run:  python test_clarifier.py
++(test_clarifier_jarvis.py tests the same Clarifier plugged into JARVIS.)
++"""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++
++import clarifier
++from clarifier import Clarifier, has_place, has_time, is_danger, missing_details
++
++ASK_BOTH = "Where are you going, and when will you be back?"
++AGAIN = "Sorry, I didn't catch that. "
++HELP = "If you need urgent help, just say help."
++
++
++def chat(*messages, **kwargs):
++    c = Clarifier(**kwargs)
++    return c, [c.step(m) for m in messages]
++
++
++# ---------------------------------------------------------------- the loop
++
++def test_asks_then_proceeds_with_the_full_request():
++    c, t = chat("I'm going out", "Le Pouce, back by two")
++    assert (t[0].action, t[0].say) == ("ask", ASK_BOTH), t[0]
++    assert t[1].action == "proceed"
++    assert t[1].request == "I'm going out. Le Pouce, back by two"
++    assert not c.waiting()
++
++
++def test_asks_only_for_what_is_still_missing():
++    _, t = chat("I'm going out", "in ten minutes", "Trou aux Cerfs")
++    assert t[1].say == "Where are you going?", t[1]
++    assert t[2].action == "proceed"
++
++
++def test_no_fixed_limit_keeps_asking():
++    _, t = chat("I'm going out", *["dunno"] * 7)
++    assert all(turn.action == "ask" for turn in t), [turn.action for turn in t]
++    assert t[1].say.startswith(AGAIN)                      # asking for the same thing again
++    help_turns = [i + 1 for i, turn in enumerate(t) if turn.say.endswith(HELP)]
++    assert help_turns == [3, 6], help_turns                # a way out on every 3rd question
++
++
++def test_optional_limit():
++    try:
++        _, t = chat("I'm going out", "dunno", "dunno", max_questions=2)
++        assert t[2].action == "sos" and "still not sure" in t[2].say, t[2]
++    finally:
++        clarifier.configure(max_questions=None)
++
++
++# ---------------------------------------------------------------- ways out of the loop
++
++def test_danger_skips_questions():
++    _, t = chat("someone is following me")
++    assert t[0].action == "sos" and "may be in danger" in t[0].say
++
++
++def test_danger_in_the_middle_of_the_loop():
++    c, t = chat("I'm going out", "dunno", "help")
++    assert t[2].action == "sos", t[2]
++    assert not c.waiting()
++
++
++def test_danger_from_another_detector():
++    _, t = chat("there's a man behind me and I don't feel ok")      # not on the keyword list
++    assert t[0].action == "proceed"
++    c = Clarifier()
++    assert c.step("there's a man behind me and I don't feel ok", danger_hint=True).action == "sos"
++
++
++def test_no_emergency_flow_says_call_999():
++    _, t = chat("I can't breathe", sos_available=False)
++    assert "call 999" in t[0].say
++
++
++def test_cancel():
++    c, t = chat("I'm going out", "never mind")
++    assert (t[1].action, t[1].say) == ("cancelled", "Okay, cancelled.")
++    assert not c.waiting()
++
++
++def test_new_question_drops_the_old_one():
++    _, t = chat("I'm going out", "When is the next bus from Curepipe?")
++    assert t[1].action == "proceed" and t[1].request == "When is the next bus from Curepipe?"
++
++
++# ---------------------------------------------------------------- any tool, any theme
++
++def test_tool_question():
++    c = Clarifier()
++    needs = [{"tool": "find_pharmacy", "param": "area", "question": "Which area are you in?"}]
++    assert c.step("Find a pharmacy", needs=needs).say == "Which area are you in?"
++    assert c.step("Rose-Hill").request == "Find a pharmacy. Rose-Hill"
++
++
++def test_tool_without_a_question_gets_one():
++    c = Clarifier()
++    one = [{"tool": "book_taxi", "param": "pickup_point"}]
++    two = [{"tool": "book_taxi", "param": "date"}, {"tool": "book_taxi", "param": "city"}]
++    assert c.step("Book a taxi", session="a", needs=one).say == "Could you tell me the pickup point?"
++    assert c.step("Book a taxi", session="b", needs=two).say == "Could you tell me the date and city?"
++
++
++def test_unclear_offers_options():
++    c = Clarifier(options=["transport", "health", "info"])
++    turn = c.step("can you sort it out", unclear=True)
++    assert turn.say == "I'm not sure I understood. I can help with: transport, health, info. Which one do you need?"
++
++
++def test_other_built_in_questions():
++    assert chat("Tell my family")[1][0].say == "What would you like me to tell them?"
++    assert chat("Is this a scam?")[1][0].say.startswith("Please read me the message")
++    assert chat("I'll be late")[1][0].say == "By how long?"
++
++
++def test_complete_requests_go_straight_through():
++    for text in ["Leaving Ebene, home by eleven", "I'm going to Curepipe, back at 5pm",
++                 "When is the next bus from Curepipe?", "Tell my family I'm safe",
++                 "My bank says my account is blocked, is it real?", "Can you help me find a clinic?"]:
++        assert Clarifier().step(text).action == "proceed", text
++
++
++# ---------------------------------------------------------------- AI-written questions
++
++def test_ai_writes_the_question():
++    ai = lambda system, user: "Where are you heading, and roughly when will you be home?"
++    _, t = chat("I'm going out", ask_llm=ai)
++    assert t[0].say == "Where are you heading, and roughly when will you be home?"
++
++
++def test_bad_ai_questions_fall_back_to_built_in():
++    for bad in ["Sure! Here you go.",                                   # not a question
++                "Can you read me your card number so I can check?",    # asks for private data
++                "Could you " + "please " * 30 + "tell me where?"]:      # far too long
++        _, t = chat("I'm going out", ask_llm=lambda s, u, bad=bad: bad)
++        assert t[0].say == ASK_BOTH, (bad, t[0].say)
++
++
++def test_ai_down_falls_back():
++    def broken(system, user):
++        raise TimeoutError("no network")
++    assert chat("I'm going out", ask_llm=broken)[1][0].say == ASK_BOTH
++
++
++def test_ai_never_rewords_safety_messages():
++    ai = lambda s, u: "What's up?"
++    assert chat("Is this a scam?", ask_llm=ai)[1][0].say.startswith("Please read me the message")
++    assert "may be in danger" in chat("help me", ask_llm=ai)[1][0].say
++
++
++# ---------------------------------------------------------------- languages, detectors, sessions
++
++def test_english_by_default_french_optional():
++    assert chat("Je sors")[1][0].say == ASK_BOTH
++    try:
++        clarifier.configure(languages=["en", "fr"])
++        assert chat("Je sors")[1][0].say == "Où allez-vous, et quand serez-vous de retour ?"
++    finally:
++        clarifier.configure(languages=["en"])
++
++
++def test_detectors():
++    assert has_time("back by two") and has_time("in half an hour") and has_time("at 14:30")
++    assert has_place("to Le Pouce") and has_place("going home") and not has_place("going out for a walk")
++    assert is_danger("Help me!") and is_danger("I can't breathe") and is_danger("au secours")
++    assert not is_danger("Can you help me find a clinic?") and not is_danger("What's the emergency number?")
++    assert not missing_details("Leaving Ebene, home by eleven")[1]
++
++
++def test_users_do_not_share_questions():
++    c = Clarifier()
++    c.step("I'm going out", session="anjali")
++    assert c.waiting("anjali") and not c.waiting("ravi")
++    assert c.step("When is the next bus?", session="ravi").action == "proceed"
++
++
++def test_works_alone_in_an_empty_folder():
++    # The real proof of "standalone": copy ONLY clarifier.py into an empty folder and use it.
++    folder = tempfile.mkdtemp()
++    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "clarifier.py"), folder)
++    code = "from clarifier import Clarifier; print(Clarifier().step(\"I'm going out\").say)"
++    out = subprocess.run([sys.executable, "-c", code], cwd=folder, capture_output=True, text=True)
++    assert out.stdout.strip() == ASK_BOTH, out.stderr
++
++
++if __name__ == "__main__":
++    tests = [(n, f) for n, f in globals().items() if n.startswith("test_")]
++    failed = 0
++    for name, fn in tests:
++        try:
++            fn()
++            print("PASS", name)
++        except AssertionError as error:
++            failed += 1
++            print("FAIL", name, "->", error)
++    print(f"\n{len(tests) - failed}/{len(tests)} passed")
++    raise SystemExit(1 if failed else 0)
+diff --git a/jarvis_code/test_clarifier_jarvis.py b/jarvis_code/test_clarifier_jarvis.py
+new file mode 100644
+index 0000000..e1e5368
+--- /dev/null
++++ b/jarvis_code/test_clarifier_jarvis.py
+@@ -0,0 +1,266 @@
++"""
++Clarifier tests INSIDE JARVIS. Run with no API keys (mock mode):  python test_clarifier_jarvis.py
++Each test plays a short conversation through the real Orchestrator and checks what JARVIS says.
++(test_clarifier.py tests clarifier.py on its own, with no other project files.)
++"""
++import os
++import tempfile
++
++for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "TYPESAFE_API_KEY"):
++    os.environ.pop(key, None)   # force mock mode so the tests never call a real model
++
++from types import SimpleNamespace as N
++
++import agents  # noqa: F401  registers the agents
++import orchestrator
++import providers
++from agents import ActionAgent, AgentSpec, build_agent
++import clarifier
++from clarifier import has_place, has_time, is_danger, missing_details, needs_clarifier
++from config import CONFIG
++from orchestrator import AGENTS, Orchestrator, SafetyGate
++
++CONFIG["audit_log"] = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
++
++# A stand-in for the check-in agent Rushil's WhatsApp tools will power.
++build_agent(AgentSpec(
++    name="checkin",
++    description="Start a safety check-in trip: where the user is going and when they will be back.",
++    instructions="Start a trip.",
++), ActionAgent)
++
++ASK_BOTH = "Where are you going, and when will you be back?"
++
++
++def talk(*turns):
++    jarvis = Orchestrator()
++    replies = [jarvis.handle(t) for t in turns]
++    return jarvis, replies
++
++
++def test_asks_for_both_missing_details_then_routes():
++    jarvis, r = talk("I'm going out", "Le Pouce, back by two")
++    assert r[0] == ASK_BOTH, r[0]
++    assert r[1].startswith("[mock:checkin]"), r[1]
++    assert "I'm going out. Le Pouce, back by two" in r[1]   # the answer was merged into the request
++    assert jarvis.clarifying is None
++
++
++def test_asks_only_for_what_is_still_missing():
++    jarvis, r = talk("I'm going out", "In ten minutes", "Trou aux Cerfs")
++    assert r[0] == ASK_BOTH
++    assert r[1] == "Where are you going?", r[1]
++    assert r[2].startswith("[mock:checkin]"), r[2]
++
++
++def test_one_detail_given_asks_for_the_other():
++    _, r = talk("I'm heading to Le Pouce")
++    assert r[0] == "When should I expect you back?", r[0]
++
++
++def test_keeps_asking_until_complete():
++    jarvis, r = talk("I'm going out", "I don't know", "dunno", "not sure", "um", "Le Pouce, back at 5pm")
++    assert r[0] == ASK_BOTH
++    assert r[1] == "Sorry, I didn't catch that. " + ASK_BOTH     # no limit: it asks again...
++    assert r[2].endswith("If you need urgent help, just say help.")   # ...with a way out every 3rd question
++    assert r[3] == r[4] == "Sorry, I didn't catch that. " + ASK_BOTH
++    assert r[5].startswith("[mock:checkin]"), r[5]               # complete at last: handed to the agent
++    assert jarvis.pending is None and jarvis.clarifying is None
++
++
++def test_saying_help_in_the_loop_offers_sos():
++    jarvis, r = talk("I'm going out", "dunno", "help")
++    assert "may be in danger" in r[2], r[2]
++    assert jarvis.pending.agent == CONFIG["sos_agent"]
++
++
++def test_danger_skips_questions():
++    jarvis, r = talk("someone is following me")
++    assert "may be in danger" in r[0], r[0]
++    assert jarvis.pending.agent == CONFIG["sos_agent"]
++    assert jarvis.handle("yes").startswith(f"[mock:{CONFIG['sos_agent']}]")
++
++
++def test_danger_mid_clarification():
++    jarvis, r = talk("I'm going out", "help!")
++    assert "may be in danger" in r[1], r[1]
++    assert jarvis.pending is not None
++
++
++def test_danger_without_sos_agent_says_call_999():
++    saved = AGENTS.pop(CONFIG["sos_agent"])
++    try:
++        jarvis, r = talk("I'm scared, he is hitting me")
++        assert "call 999" in r[0] and jarvis.pending is None, r[0]
++    finally:
++        AGENTS[CONFIG["sos_agent"]] = saved
++
++
++def test_cancel_mid_clarification():
++    jarvis, r = talk("I'm going out", "never mind")
++    assert r[1] == "Okay, cancelled." and jarvis.clarifying is None
++
++
++def test_complete_requests_are_not_clarified():
++    for text in ["Leaving Ebene, home by eleven", "I'm going to Curepipe, back at 5pm",
++                 "When is the next bus from Curepipe?", "Tell my family I'm safe",
++                 "My bank says my account is blocked, is it real?"]:
++        rule, missing = missing_details(text)
++        assert not missing, (text, missing)
++
++
++def test_other_rules():
++    assert talk("Tell my family")[1][0] == "What would you like me to tell them?"
++    assert talk("Is this a scam?")[1][0].startswith("Please read me the message")
++    assert talk("I'll be late")[1][0] == "By how long?"
++
++
++def test_detectors():
++    assert has_time("back by two") and has_time("in half an hour") and has_time("at 14:30")
++    assert not has_time("I'm going out")
++    assert has_place("to Le Pouce") and has_place("going home") and not has_place("going out for a walk")
++    assert is_danger("Help me!") and is_danger("I can't breathe") and is_danger("au secours")
++    assert not is_danger("Can you help me find a clinic?") and not is_danger("What's the emergency number?")
++
++
++def test_new_question_is_not_merged_into_old_one():
++    jarvis, r = talk("I'm going out", "What should I do in a cyclone class 3?")
++    assert r[0] == ASK_BOTH
++    assert "task='What should I do in a cyclone class 3?'" in r[1], r[1]   # routed on its own
++    assert "going out" not in r[1]                                        # not glued to the old request
++    assert jarvis.clarifying is None
++
++
++def test_english_only_by_default():
++    assert clarifier.SETTINGS["languages"] == ["en"]
++    assert talk("Je sors")[1][0] == ASK_BOTH            # French words understood, reply in English
++    assert "may be in danger" in talk("au secours")[1][0]   # French danger still caught
++
++
++def test_french():
++    clarifier.configure(languages=["en", "fr"])
++    try:
++        _test_french()
++    finally:
++        clarifier.configure(languages=["en"])
++
++
++def _test_french():
++    jarvis, r = talk("Je sors", "dans dix minutes")
++    assert r[0] == "Où allez-vous, et quand serez-vous de retour ?", r[0]
++    assert r[1] == "Où allez-vous ?", r[1]
++    # Answering "au Pouce" completes it (which agent gets it is the router's job, not tested here).
++    jarvis.clarifying.answers.append("au Pouce")
++    assert not needs_clarifier("Je sors. dans dix minutes. au Pouce", jarvis.clarifying)
++    assert not missing_details("Je sors, au marché, je rentre vers deux heures")[1]
++    assert talk("Je pars à Curepipe")[1][0] == "À quelle heure dois-je vous attendre ?"
++    assert talk("Dis à ma famille")[1][0] == "Que voulez-vous que je leur dise ?"
++    assert talk("Est-ce une arnaque ?")[1][0].startswith("Lisez-moi le message")
++    assert talk("Je serai en retard")[1][0] == "De combien de temps ?"
++    jarvis, r = talk("Je sors", "laisse tomber")
++    assert r[1] == "D'accord, c'est annulé.", r[1]
++    jarvis, r = talk("Quelqu'un me suit")
++    assert r[0].startswith("On dirait que vous êtes en danger"), r[0]
++    assert jarvis.pending is not None
++    for text in ["au secours", "Aidez-moi", "j'ai peur", "il me frappe", "je ne peux pas respirer",
++                 "appelez la police", "à l'aide"]:
++        assert is_danger(text), text
++    for text in ["Pouvez-vous m'aider à trouver une clinique ?", "Quel est le numéro d'urgence ?"]:
++        assert not is_danger(text), text
++
++
++def test_english_and_french_only():
++    assert not is_danger("mo bizin led")   # Kreol is not supported
++
++
++class FakeClaude:
++    # Stands in for Claude: says a detail is missing until the user has given an area.
++    def __init__(self):
++        self.messages = self
++
++    def create(self, **kwargs):
++        prompt = str(kwargs["messages"][0]["content"])
++        if str(kwargs.get("system", "")).startswith("You are a router"):
++            task = prompt.replace('"', "'")
++            return N(stop_reason="end_turn", content=[N(type="text", text=f'[{{"agent": "health", "task": "{task}"}}]')])
++        if "Rose-Hill" in prompt:
++            return N(stop_reason="end_turn", content=[N(type="text", text="Clinic Central in Rose-Hill is open.")])
++        return N(stop_reason="end_turn", content=[N(type="text", text="NEED_DETAILS: find_clinic.area")])
++
++
++def test_any_tool_missing_detail_is_asked_for():
++    saved = providers.claude.client
++    agents.claude.client = FakeClaude()
++    try:
++        jarvis, r = talk("Find me a clinic", "Rose-Hill")
++        assert r[0] == "Which area are you in?", r[0]          # the question comes from the tool's `asks`
++        assert "Clinic Central" in r[1], r[1]                  # answer merged, the agent completes it
++        assert jarvis.clarifying is None
++    finally:
++        agents.claude.client = saved
++
++
++def test_tool_without_asks_gets_a_default_question():
++    from clarifier import ask_for_tool_details
++    assert ask_for_tool_details([{"tool": "t", "param": "pickup_point", "question": None}]) == \
++        "Could you tell me the pickup point?"
++    assert ask_for_tool_details([{"tool": "t", "param": "date", "question": None},
++                                 {"tool": "t", "param": "city", "question": None}]) == \
++        "Could you tell me the date and city?"
++
++
++class FakeJev:
++    live = True
++
++    def __init__(self, danger):
++        self.danger = danger
++
++    def ask(self, state, questions):
++        answers = {"is_clear": {"noul": 0.9}, "route": {"choice": "info", "confidence": 0.9, "probabilities": {}}}
++        if "is_danger" in questions:
++            answers["is_danger"] = {"noul": self.danger}
++        return answers
++
++
++def test_jev_catches_danger_the_keywords_miss():
++    saved = orchestrator.jev
++    try:
++        orchestrator.jev = FakeJev(danger=0.92)
++        text = "there's a man behind me and I don't feel ok"
++        assert not is_danger(text)                             # not on the keyword list...
++        jarvis, r = talk(text)
++        assert "may be in danger" in r[0], r[0]                # ...but Jev catches it
++        orchestrator.jev = FakeJev(danger=0.10)
++        assert "may be in danger" not in talk("What should I do in a cyclone class 3?")[1][0]
++    finally:
++        orchestrator.jev = saved
++
++
++def test_sessions_do_not_share_questions():
++    a, b = Orchestrator(), Orchestrator()
++    a.handle("I'm going out")
++    assert a.clarifying is not None and b.clarifying is None
++
++
++def test_safety_gate_never_blocks_the_clarifier():
++    original = SafetyGate.decide
++    SafetyGate.decide = lambda self, step: "refuse"
++    try:
++        _, r = talk("someone is following me")
++        assert "may be in danger" in r[0], r[0]
++    finally:
++        SafetyGate.decide = original
++
++
++if __name__ == "__main__":
++    tests = [(n, f) for n, f in globals().items() if n.startswith("test_")]
++    failed = 0
++    for name, fn in tests:
++        try:
++            fn()
++            print("PASS", name)
++        except AssertionError as error:
++            failed += 1
++            print("FAIL", name, "->", error)
++    print(f"\n{len(tests) - failed}/{len(tests)} passed")
++    raise SystemExit(1 if failed else 0)
